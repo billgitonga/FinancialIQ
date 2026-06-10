@@ -1,0 +1,36 @@
+FinanceIQ/
+├── .env
+├── main.py
+├── dashboard.py
+├── requirements.txt
+├── train_model.py
+├── test_ocr.py
+├── app/
+│   ├── __init__.py
+│   ├── agent.py
+│   ├── anomaly.py
+│   ├── auth.py
+│   ├── budget.py
+│   ├── cache.py
+│   ├── categorizer.py
+│   ├── chatbot.py
+│   ├── config.py
+│   ├── database.py
+│   ├── extractor.py
+│   ├── financial_ai.py
+│   ├── health.py
+│   ├── ingestion.py
+│   ├── insights.py
+│   ├── llm.py
+│   ├── logger.py
+│   ├── lstm_predictor.py
+│   ├── memory.py
+│   ├── ml_categorizer.py
+│   ├── ocr.py
+│   ├── optimizer.py
+│   ├── pipeline.py
+│   ├── predictor.py
+│   ├── retriever.py
+│   ├── simulator.py
+│   ├── trends.py
+│   └── users.py

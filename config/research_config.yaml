@@ -1,0 +1,89 @@
+# config/research_config.yaml
+# FinanceIQ Research Configuration
+# As specified in the research proposal
+
+research:
+  title: "A Framework for Digitizing and Automating Records to Enhance Information Analysis in the Business and Financial Sector"
+  methodology: "Design Science Research (DSR)"
+  author: "Bill K. Gitonga (P108/1840g/20)"
+  course: "Bachelor Of Science In Information Science"
+  
+  evaluation_metrics:
+    primary:
+      - name: "Processing Time"
+        unit: "seconds"
+        description: "Time taken to process records end-to-end"
+      - name: "Accuracy Rate"
+        unit: "percentage"
+        description: "Categorization accuracy vs ground truth"
+      - name: "Error Reduction"
+        unit: "percentage"
+        description: "Reduction in errors vs manual processing"
+    
+    secondary:
+      - name: "Anomaly Detection Precision"
+        unit: "ratio"
+        description: "Precision of anomaly detection"
+      - name: "Anomaly Detection Recall"
+        unit: "ratio"
+        description: "Recall of anomaly detection"
+      - name: "Records Per Second"
+        unit: "records/second"
+        description: "Processing throughput"
+
+  test_scenarios:
+    - id: "test_001"
+      name: "Single Invoice Processing"
+      input_format: "PDF"
+      description: "Process a single invoice document"
+      
+    - id: "test_002"
+      name: "Batch Transaction Processing"
+      input_format: "CSV"
+      description: "Process multiple transaction records"
+      
+    - id: "test_003"
+      name: "Mixed Format Processing"
+      input_format: "Mixed (PDF, Image, CSV)"
+      description: "Process records from multiple sources"
+      
+    - id: "test_004"
+      name: "Manual vs Automated Comparison"
+      input_format: "CSV"
+      description: "Compare manual and automated processing"
+
+framework_layers:
+  layer1:
+    name: "Data Ingestion"
+    description: "Multi-format input support"
+    supported_formats: ["csv", "pdf", "png", "jpg", "jpeg"]
+    technologies: ["Python", "Streamlit", "File I/O"]
+    
+  layer2:
+    name: "Digitization & Processing"
+    description: "OCR and data structuring"
+    technologies: ["Tesseract OCR", "Pandas", "Python re"]
+    functions: ["text_extraction", "data_cleaning", "categorization"]
+    
+  layer3:
+    name: "Storage"
+    description: "Structured data persistence"
+    technologies: ["PostgreSQL", "SQLite", "SQLAlchemy"]
+    schema_tables: ["users", "transactions", "trends", "anomalies", "evaluation_results", "pipeline_logs"]
+    
+  layer4:
+    name: "Analytics & Automation Engine"
+    description: "Intelligent analysis algorithms"
+    algorithms:
+      - "Isolation Forest (anomaly detection)"
+      - "Z-Score (statistical anomalies)"
+      - "Logistic Regression (categorization)"
+      - "Linear Regression (forecasting)"
+      - "LSTM (deep learning forecasting)"
+    functions: ["trend_analysis", "anomaly_detection", "risk_assessment", "forecasting", "optimization"]
+    
+  layer5:
+    name: "Reporting & Visualization"
+    description: "Insight delivery and reporting"
+    technologies: ["Streamlit", "Pandas", "Matplotlib", "Excel"]
+    outputs: ["Interactive Dashboard", "Excel Reports", "JSON Reports", "Evaluation Reports"]
