@@ -185,6 +185,22 @@ def init_db():
                     FOREIGN KEY(credit_sale_id) REFERENCES credit_sales(id)
                 )
             """))
+            
+            # Credit limit history
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS credit_limit_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_name TEXT NOT NULL,
+                    customer_id INTEGER,
+                    previous_limit REAL,
+                    new_limit REAL,
+                    change_reason TEXT,
+                    changed_by TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(user_name) REFERENCES users(username),
+                    FOREIGN KEY(customer_id) REFERENCES customers(id)
+                )
+            """))
 
             # Suppliers
             conn.execute(text("""
@@ -418,6 +434,7 @@ def init_db():
                 "CREATE INDEX IF NOT EXISTS idx_products_user_name ON products(user_name)",
                 "CREATE INDEX IF NOT EXISTS idx_customers_user_name ON customers(user_name)",
                 "CREATE INDEX IF NOT EXISTS idx_credit_sales_user_customer ON credit_sales(user_name, customer_id)",
+                "CREATE INDEX IF NOT EXISTS idx_credit_limit_history_customer ON credit_limit_history(customer_id)",
                 "CREATE INDEX IF NOT EXISTS idx_suppliers_user_name ON suppliers(user_name)",
                 "CREATE INDEX IF NOT EXISTS idx_expense_approvals_status ON expense_approvals(status)",
             ]
@@ -862,6 +879,12 @@ def update_customer_credit_limit(user_name, customer_id, new_credit_limit, appro
                 conn.execute(text("UPDATE customers SET approved_by = :ab, approved_at = :aat WHERE id = :cid AND user_name = :u"),
                            {"ab": approved_by, "aat": datetime.now().isoformat(), "cid": customer_id, "u": user_name})
             
+            # Record credit limit change history
+            conn.execute(text("""
+                INSERT INTO credit_limit_history (user_name, customer_id, previous_limit, new_limit, change_reason, changed_by, created_at)
+                VALUES (:u, :cid, :pl, :nl, :cr, :cb, :cat)
+            """), {"u": user_name, "cid": customer_id, "pl": old_limit, "nl": new_credit_limit, "cr": notes, "cb": approved_by, "cat": datetime.now().strftime("%Y-%m-%d %H:%M:%S")} )
+            
             action = "increased" if new_credit_limit > old_limit else "decreased" if new_credit_limit < old_limit else "unchanged"
         return True, f"Credit limit {action} to KES {new_credit_limit:,.2f}. Status: {credit_status}"
     except Exception as e:
@@ -889,7 +912,7 @@ def get_customer_credit_history(user_name, customer_id):
     try:
         with engine.connect() as conn:
             credit_sales = pd.read_sql(text("""
-                SELECT cs.id, cs.date, cs.amount, cs.description, cs.due_date, cs.paid_amount, cs.status
+                SELECT cs.id, cs.date, cs.amount, cs.description, cs.due_date, cs.paid_amount, cs.status, cs.approved_by
                 FROM credit_sales cs
                 WHERE cs.user_name = :u AND cs.customer_id = :cid
                 ORDER BY cs.date DESC
@@ -906,6 +929,21 @@ def get_customer_credit_history(user_name, customer_id):
         return credit_sales, payments
     except Exception:
         return pd.DataFrame(), pd.DataFrame()
+
+
+def get_credit_limit_history(user_name, customer_id):
+    """Get credit limit change history for a customer."""
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(text("""
+                SELECT id, previous_limit, new_limit, change_reason, changed_by, created_at
+                FROM credit_limit_history
+                WHERE user_name = :u AND customer_id = :cid
+                ORDER BY created_at DESC
+            """), conn, params={"u": user_name, "cid": customer_id})
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 
 def get_credit_status_summary(user_name):
@@ -974,13 +1012,13 @@ def update_credit_statuses(user_name):
         return False, str(e)
 
 
-def add_credit_sale(user_name, customer_id, amount, description, due_date):
+def add_credit_sale(user_name, customer_id, amount, description, due_date, approved_by=None):
     try:
         with get_connection() as conn:
             conn.execute(text("""
-                INSERT INTO credit_sales (user_name, customer_id, date, amount, description, due_date)
-                VALUES (:u, :cid, :d, :a, :desc, :dd)
-            """), {"u": user_name, "cid": customer_id, "d": datetime.now().strftime("%Y-%m-%d"), "a": amount, "desc": description, "dd": due_date})
+                INSERT INTO credit_sales (user_name, customer_id, date, amount, description, due_date, approved_by)
+                VALUES (:u, :cid, :d, :a, :desc, :dd, :ab)
+            """), {"u": user_name, "cid": customer_id, "d": datetime.now().strftime("%Y-%m-%d"), "a": amount, "desc": description, "dd": due_date, "ab": approved_by})
             conn.execute(text("UPDATE customers SET current_balance = current_balance + :a WHERE id = :cid"), {"a": amount, "cid": customer_id})
         return True, "Credit sale recorded"
     except Exception as e:
