@@ -25,4 +25,4 @@ echo ""
 echo "Press Ctrl+C to stop the server"
 echo ""
 
-streamlit run dashboard.py
+streamlit run dashboard.py --server.port 8501 --server.headless true

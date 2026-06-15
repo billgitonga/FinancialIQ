@@ -219,9 +219,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-echo ".~lock.FinancialIQ.docx#" >> .gitignore
-echo "finance.db" >> .gitignore
-echo "kilocode.vsix" >> .gitignore
-echo "ocr_cache/" >> .gitignore
-echo "memory_store/" >> .gitignore
-echo "budget_store.json" >> .gitignore
+# FinancialIQ specific
+.~lock.FinancialIQ.docx#
+finance.db
+kilocode.vsix
+ocr_cache/
+memory_store/
+budget_store.json

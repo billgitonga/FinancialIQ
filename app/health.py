@@ -3,16 +3,16 @@
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from functools import lru_cache
 from typing import Dict, List, Optional, Any
 
 
 DEFAULT_CONFIG = {
     "weights": {
-        "stability": 0.30,
-        "balance": 0.25,
-        "essential_spending": 0.25,
-        "spending_spikes": 0.20
+        "stability": 0.25,
+        "balance": 0.20,
+        "essential_spending": 0.20,
+        "spending_spikes": 0.15,
+        "spending_velocity": 0.20
     },
     "thresholds": {
         "low_volatility": 0.5,
@@ -82,7 +82,7 @@ def _filter_current_month(df: pd.DataFrame) -> pd.DataFrame:
     return filtered[
         (filtered["date"].dt.month == now.month) &
         (filtered["date"].dt.year == now.year)
-    ]
+    ].copy()
 
 
 def _category_distribution(df: pd.DataFrame) -> Dict[str, float]:
@@ -133,7 +133,7 @@ def _spending_stability(
     amounts = expenses["amount"]
 
     mean = amounts.mean()
-    std = amounts.std()
+    std = amounts.std(ddof=0) if len(amounts) > 1 else 0.0
 
     if mean <= 0 or np.isnan(mean):
         return 50.0
@@ -204,13 +204,9 @@ def _essential_vs_nonessential(
         return 40.0
 
 
-def _high_spend_penalty(
-    df: pd.DataFrame,
-    spike_multiplier: float
-) -> float:
+def _high_spend_penalty(df: pd.DataFrame, iqr_multiplier: float) -> float:
     """
-    Detect unusually large spending spikes.
-    Uses IQR-based outlier detection instead of mean*2.
+    Detect unusually large spending spikes using IQR-based outlier detection.
     """
     if df.empty:
         return 50.0
@@ -227,7 +223,10 @@ def _high_spend_penalty(
 
     iqr = q3 - q1
 
-    upper_bound = q3 + (spike_multiplier * iqr)
+    if iqr == 0:
+        return 90.0
+
+    upper_bound = q3 + (iqr_multiplier * iqr)
 
     spikes = expenses[expenses["amount"] > upper_bound]
 
@@ -241,6 +240,96 @@ def _high_spend_penalty(
         return 60.0
     else:
         return 40.0
+
+
+def _calculate_spending_velocity(df: pd.DataFrame) -> float:
+    """
+    Measure spending velocity (burn rate) relative to typical patterns.
+    Higher velocity = faster spending, may indicate risk.
+    """
+    if df.empty or "date" not in df.columns:
+        return 50.0
+
+    expenses = df[df["amount"] > 0]
+    if expenses.empty:
+        return 50.0
+
+    expenses = expenses.copy()
+    expenses["date"] = pd.to_datetime(expenses["date"], errors="coerce")
+    expenses = expenses.dropna(subset=["date"])
+
+    if expenses.empty:
+        return 50.0
+
+    daily_spending = expenses.groupby(expenses["date"].dt.date)["amount"].sum()
+    mean_daily = daily_spending.mean()
+
+    if mean_daily <= 0 or np.isnan(mean_daily):
+        return 50.0
+
+    daily_std = daily_spending.std(ddof=0) if len(daily_spending) > 1 else 0.0
+    daily_volatility = daily_std / mean_daily if mean_daily > 0 else 0
+
+    if daily_volatility < 0.3:
+        return 90.0
+    elif daily_volatility < 0.6:
+        return 75.0
+    elif daily_volatility < 1.0:
+        return 60.0
+    else:
+        return 40.0
+
+
+def _calculate_components(
+    df: pd.DataFrame,
+    config: Dict[str, Any]
+) -> Dict[str, float]:
+    """
+    Calculate all health score components.
+    """
+    distribution = _category_distribution(df)
+
+    stability = _spending_stability(df, config)
+    balance = _category_balance(distribution)
+    essential_score = _essential_vs_nonessential(
+        distribution,
+        config["essential_categories"]
+    )
+    spike_score = _high_spend_penalty(
+        df,
+        config["thresholds"]["spike_multiplier"]
+    )
+    velocity_score = _calculate_spending_velocity(df)
+
+    return {
+        "stability": stability,
+        "balance": balance,
+        "essential_spending": essential_score,
+        "spending_spikes": spike_score,
+        "spending_velocity": velocity_score,
+        "distribution": distribution,
+    }
+
+
+def _compute_weighted_score(
+    components: Dict[str, float],
+    weights: Dict[str, float]
+) -> float:
+    """
+    Compute weighted score from components.
+    """
+    return round(
+        sum(
+            components[k] * weights[k]
+            for k in [
+                "stability", "balance",
+                "essential_spending", "spending_spikes",
+                "spending_velocity"
+            ]
+            if k in components
+        ),
+        2
+    )
 
 
 def calculate_health_score(
@@ -258,32 +347,9 @@ def calculate_health_score(
     if df.empty:
         return None
 
-    distribution = _category_distribution(df)
+    components = _calculate_components(df, config)
 
-    stability = _spending_stability(df, config)
-
-    balance = _category_balance(distribution)
-
-    essential_score = _essential_vs_nonessential(
-        distribution,
-        config["essential_categories"]
-    )
-
-    spike_score = _high_spend_penalty(
-        df,
-        config["thresholds"]["spike_multiplier"]
-    )
-
-    weights = config["weights"]
-
-    score = (
-        stability * weights["stability"] +
-        balance * weights["balance"] +
-        essential_score * weights["essential_spending"] +
-        spike_score * weights["spending_spikes"]
-    )
-
-    return round(score, 2)
+    return _compute_weighted_score(components, config["weights"])
 
 
 def health_report(
@@ -306,41 +372,19 @@ def health_report(
             "category_distribution": {}
         }
 
-    distribution = _category_distribution(df)
-
-    stability = _spending_stability(df, config)
-
-    balance = _category_balance(distribution)
-
-    essential_score = _essential_vs_nonessential(
-        distribution,
-        config["essential_categories"]
-    )
-
-    spike_score = _high_spend_penalty(
-        df,
-        config["thresholds"]["spike_multiplier"]
-    )
-
-    weights = config["weights"]
-
-    score = round(
-        stability * weights["stability"] +
-        balance * weights["balance"] +
-        essential_score * weights["essential_spending"] +
-        spike_score * weights["spending_spikes"],
-        2
-    )
+    components = _calculate_components(df, config)
+    score = _compute_weighted_score(components, config["weights"])
 
     return {
         "score": score,
         "components": {
-            "stability": stability,
-            "balance": balance,
-            "essential_spending": essential_score,
-            "spending_spikes": spike_score
+            "stability": components["stability"],
+            "balance": components["balance"],
+            "essential_spending": components["essential_spending"],
+            "spending_spikes": components["spending_spikes"],
+            "spending_velocity": components["spending_velocity"]
         },
-        "category_distribution": distribution,
+        "category_distribution": components["distribution"],
         "transaction_count": len(df),
         "generated_at": datetime.now().isoformat()
     }
@@ -394,14 +438,24 @@ def health_insights(
             "Frequent unusually large transactions detected."
         )
 
+    if components.get("spending_velocity", 0) < 60:
+        insights.append(
+            "Spending velocity is high. "
+            "Monitor daily spending patterns."
+        )
+
     top_categories = report.get("category_distribution", {})
 
     if top_categories:
-        top_category = next(iter(top_categories.items()))
-
-        insights.append(
-            f"Highest spending category: "
-            f"{top_category[0]} ({top_category[1]:.2f}%)"
-        )
+        sorted_cats = sorted(
+            top_categories.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )[:3]
+        if sorted_cats:
+            top_cat_str = ", ".join(
+                f"{cat} ({pct:.1f}%)" for cat, pct in sorted_cats
+            )
+            insights.append(f"Top spending categories: {top_cat_str}")
 
     return insights

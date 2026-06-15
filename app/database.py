@@ -47,6 +47,7 @@ def init_db():
                     email TEXT,
                     phone TEXT,
                     blocked INTEGER DEFAULT 0,
+                    is_active INTEGER DEFAULT 1,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """))
@@ -57,6 +58,11 @@ def init_db():
 
             try:
                 conn.execute(text("ALTER TABLE users ADD COLUMN full_name TEXT"))
+            except Exception:
+                pass
+
+            try:
+                conn.execute(text("ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1"))
             except Exception:
                 pass
 
@@ -93,6 +99,15 @@ def init_db():
                     FOREIGN KEY(user_name) REFERENCES users(username)
                 )
             """))
+
+            try:
+                conn.execute(text("ALTER TABLE credit_sales ADD COLUMN recorded_by TEXT"))
+            except Exception:
+                pass
+            try:
+                conn.execute(text("ALTER TABLE credit_payments ADD COLUMN recorded_by TEXT"))
+            except Exception:
+                pass
 
             # Products
             conn.execute(text("""
@@ -152,7 +167,7 @@ def init_db():
             """))
 
 # Credit sales
-             conn.execute(text("""
+            conn.execute(text("""
                  CREATE TABLE IF NOT EXISTS credit_sales (
                      id INTEGER PRIMARY KEY AUTOINCREMENT,
                      user_name TEXT NOT NULL,
@@ -206,17 +221,21 @@ def init_db():
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS suppliers (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_name TEXT NOT NULL,
+                    user_name TEXT,
                     name TEXT NOT NULL,
                     phone TEXT,
                     email TEXT,
                     address TEXT,
                     payment_terms TEXT,
                     average_delivery_days INTEGER,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(user_name) REFERENCES users(username)
+                    notes TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """))
+            try:
+                conn.execute(text("ALTER TABLE suppliers ADD COLUMN notes TEXT"))
+            except Exception:
+                pass
 
             # Supplier transactions
             conn.execute(text("""
@@ -602,6 +621,78 @@ def get_all_users(current_user=None):
             return []
 
 
+def get_user_performance():
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(text("""
+                WITH
+                tx AS (
+                    SELECT username, COUNT(*) as cnt, COALESCE(SUM(CASE WHEN status = 'approved' THEN amount ELSE 0 END), 0) as total
+                    FROM transactions GROUP BY username
+                ),
+                di AS (
+                    SELECT user_name, COUNT(*) as cnt,
+                           COALESCE(SUM(CASE WHEN item_type = 'income' THEN amount ELSE 0 END), 0) as income,
+                           COALESCE(SUM(CASE WHEN item_type = 'expense' THEN amount ELSE 0 END), 0) as expenses
+                    FROM daily_items GROUP BY user_name
+                ),
+                cs AS (
+                    SELECT user_name, COUNT(*) as cnt, COALESCE(SUM(amount), 0) as total
+                    FROM credit_sales GROUP BY user_name
+                ),
+                cp AS (
+                    SELECT user_name, COUNT(*) as cnt, COALESCE(SUM(amount), 0) as total
+                    FROM credit_payments GROUP BY user_name
+                ),
+                inv AS (
+                    SELECT user_name, COUNT(*) as cnt, COALESCE(SUM(total_amount), 0) as total
+                    FROM invoices GROUP BY user_name
+                ),
+                cf AS (
+                    SELECT user_name, COUNT(*) as cnt, COALESCE(SUM(CASE WHEN flow_type = 'inflow' THEN amount ELSE -amount END), 0) as net
+                    FROM cash_flow GROUP BY user_name
+                ),
+                er AS (
+                    SELECT user_name, COUNT(*) as cnt, COALESCE(SUM(CASE WHEN status = 'approved' THEN amount ELSE 0 END), 0) as approved
+                    FROM expense_approvals GROUP BY user_name
+                )
+                SELECT
+                    u.username,
+                    u.role,
+                    u.full_name,
+                    COALESCE(tx.cnt, 0) as transactions_count,
+                    COALESCE(tx.total, 0) as transactions_total,
+                    COALESCE(di.cnt, 0) as daily_items_count,
+                    COALESCE(di.income, 0) as daily_income,
+                    COALESCE(di.expenses, 0) as daily_expenses,
+                    (SELECT COUNT(*) FROM customers WHERE user_name = u.username) as customers_count,
+                    COALESCE(cs.cnt, 0) as credit_sales_count,
+                    COALESCE(cs.total, 0) as credit_sales_total,
+                    COALESCE(cp.cnt, 0) as credit_payments_count,
+                    COALESCE(cp.total, 0) as credit_payments_total,
+                    (SELECT COUNT(*) FROM products WHERE user_name = u.username) as products_count,
+                    (SELECT COUNT(*) FROM suppliers WHERE user_name = u.username) as suppliers_count,
+                    COALESCE(inv.cnt, 0) as invoices_count,
+                    COALESCE(inv.total, 0) as invoices_total,
+                    COALESCE(cf.cnt, 0) as cash_flow_count,
+                    COALESCE(cf.net, 0) as cash_flow_net,
+                    COALESCE(er.cnt, 0) as expense_requests_count,
+                    COALESCE(er.approved, 0) as expenses_approved
+                FROM users u
+                LEFT JOIN tx ON tx.username = u.username
+                LEFT JOIN di ON di.user_name = u.username
+                LEFT JOIN cs ON cs.user_name = u.username
+                LEFT JOIN cp ON cp.user_name = u.username
+                LEFT JOIN inv ON inv.user_name = u.username
+                LEFT JOIN cf ON cf.user_name = u.username
+                LEFT JOIN er ON er.user_name = u.username
+                ORDER BY transactions_total DESC, credit_sales_total DESC
+            """), conn)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
 def delete_user(username):
     try:
         with get_connection() as conn:
@@ -744,9 +835,9 @@ def save_anomalies(username, anomalies_df):
 def add_product(user_name, name, sku, category, buying_price, selling_price, current_stock=0, min_stock_level=0, unit="pcs", supplier_id=None):
     try:
         with get_connection() as conn:
-            existing = conn.execute(text("SELECT id FROM products WHERE sku = :s AND user_name = :u"), {"s": sku, "u": user_name}).fetchone()
+            existing = conn.execute(text("SELECT id FROM products WHERE sku = :s"), {"s": sku}).fetchone()
             if existing:
-                return False, "Product with this SKU already exists"
+                return False, "Product with this SKU already exists in inventory"
             conn.execute(text("""
                 INSERT INTO products (user_name, name, sku, category, buying_price, selling_price, current_stock, min_stock_level, unit, supplier_id)
                 VALUES (:u, :n, :s, :c, :bp, :sp, :cs, :ms, :un, :si)
@@ -763,8 +854,51 @@ def get_all_products(user_name):
                 SELECT p.*, s.name as supplier_name
                 FROM products p
                 LEFT JOIN suppliers s ON p.supplier_id = s.id
-                WHERE p.user_name = :u
                 ORDER BY p.name
+            """), conn)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_top_products_performance(user_name):
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(text("""
+                WITH stock_movements_summary AS (
+                    SELECT
+                        product_id,
+                        SUM(CASE WHEN movement_type = 'sale' THEN quantity ELSE 0 END) as units_sold,
+                        SUM(CASE WHEN movement_type = 'sale' THEN quantity * (SELECT selling_price FROM products WHERE id = sm.product_id) ELSE 0 END) as sales_revenue,
+                        SUM(CASE WHEN movement_type = 'purchase' THEN quantity ELSE 0 END) as units_purchased,
+                        SUM(CASE WHEN movement_type = 'purchase' THEN quantity * (SELECT buying_price FROM products WHERE id = sm.product_id) ELSE 0 END) as purchase_cost
+                    FROM stock_movements sm
+                    WHERE user_name = :u
+                    GROUP BY product_id
+                )
+                SELECT
+                    p.id,
+                    p.name,
+                    p.category,
+                    p.sku,
+                    p.current_stock,
+                    p.min_stock_level,
+                    p.buying_price,
+                    p.selling_price,
+                    (p.selling_price - p.buying_price) as profit_per_unit,
+                    CASE WHEN p.selling_price > 0 THEN ((p.selling_price - p.buying_price) / p.selling_price) * 100 ELSE 0 END as profit_margin_percent,
+                    p.current_stock * p.selling_price as stock_value,
+                    COALESCE(sms.units_sold, 0) as units_sold,
+                    COALESCE(sms.sales_revenue, 0) as sales_revenue,
+                    COALESCE(sms.units_purchased, 0) as units_purchased,
+                    COALESCE(sms.purchase_cost, 0) as purchase_cost,
+                    CASE WHEN p.current_stock <= p.min_stock_level THEN 'Low Stock'
+                         WHEN p.current_stock <= p.min_stock_level * 1.5 THEN 'Watch'
+                         ELSE 'Healthy' END as stock_status
+                FROM products p
+                LEFT JOIN stock_movements_summary sms ON sms.product_id = p.id
+                WHERE p.user_name = :u
+                ORDER BY sales_revenue DESC, units_sold DESC, profit_margin_percent DESC
             """), conn, params={"u": user_name})
         return df
     except Exception:
@@ -775,9 +909,9 @@ def update_stock(user_name, product_id, quantity, movement_type, reference="", n
     pid = int(product_id)
     try:
         with get_connection() as conn:
-            product = conn.execute(text("SELECT current_stock, min_stock_level FROM products WHERE id = :id AND user_name = :u"), {"id": pid, "u": user_name}).fetchone()
+            product = conn.execute(text("SELECT current_stock, min_stock_level FROM products WHERE id = :id"), {"id": pid}).fetchone()
             if not product:
-                return False, "Product not found"
+                return False, "Product not found in inventory"
             current_stock = product[0]
             min_stock = product[1] if len(product) > 1 else 0
             if movement_type == "sale":
@@ -793,7 +927,7 @@ def update_stock(user_name, product_id, quantity, movement_type, reference="", n
                     new_stock = quantity
             else:
                 new_stock = current_stock
-            conn.execute(text("UPDATE products SET current_stock = :ns WHERE id = :id AND user_name = :u"), {"ns": new_stock, "id": pid, "u": user_name})
+            conn.execute(text("UPDATE products SET current_stock = :ns WHERE id = :id"), {"ns": new_stock, "id": pid})
             conn.execute(text("""
                 INSERT INTO stock_movements (user_name, product_id, date, quantity, movement_type, reference, notes)
                 VALUES (:u, :pid, :d, :q, :mt, :r, :n)
@@ -805,15 +939,23 @@ def update_stock(user_name, product_id, quantity, movement_type, reference="", n
         return False, str(e)
 
 
-def get_low_stock_products(user_name):
+def get_low_stock_products(user_name=None):
     try:
         with engine.connect() as conn:
-            df = pd.read_sql(text("""
-                SELECT name, sku, current_stock, min_stock_level, selling_price
-                FROM products
-                WHERE user_name = :u AND current_stock <= min_stock_level AND current_stock > 0
-                ORDER BY current_stock ASC
-            """), conn, params={"u": user_name})
+            if user_name:
+                df = pd.read_sql(text("""
+                    SELECT name, sku, current_stock, min_stock_level, selling_price
+                    FROM products
+                    WHERE user_name = :u AND current_stock <= min_stock_level AND current_stock > 0
+                    ORDER BY current_stock ASC
+                """), conn, params={"u": user_name})
+            else:
+                df = pd.read_sql(text("""
+                    SELECT name, sku, current_stock, min_stock_level, selling_price
+                    FROM products
+                    WHERE current_stock <= min_stock_level AND current_stock > 0
+                    ORDER BY current_stock ASC
+                """), conn)
         return df
     except Exception:
         return pd.DataFrame()
@@ -833,14 +975,21 @@ def add_customer(user_name, name, phone, email="", address="", credit_limit=0, a
         return False, str(e)
 
 
-def get_all_customers(user_name):
+def get_all_customers(user_name=None):
     try:
         with engine.connect() as conn:
-            df = pd.read_sql(text("""
-                SELECT id, name, phone, email, credit_limit, current_balance, credit_status, 
-                       approved_by, approved_at, last_credit_review, notes
-                FROM customers WHERE user_name = :u ORDER BY name
-            """), conn, params={"u": user_name})
+            if user_name:
+                df = pd.read_sql(text("""
+                    SELECT id, name, phone, email, credit_limit, current_balance, credit_status, 
+                           approved_by, approved_at, last_credit_review, notes
+                    FROM customers WHERE user_name = :u ORDER BY name
+                """), conn, params={"u": user_name})
+            else:
+                df = pd.read_sql(text("""
+                    SELECT id, name, phone, email, credit_limit, current_balance, credit_status, 
+                           approved_by, approved_at, last_credit_review, notes
+                    FROM customers ORDER BY name
+                """), conn)
         return df
     except Exception:
         return pd.DataFrame()
@@ -912,7 +1061,7 @@ def get_customer_credit_history(user_name, customer_id):
     try:
         with engine.connect() as conn:
             credit_sales = pd.read_sql(text("""
-                SELECT cs.id, cs.date, cs.amount, cs.description, cs.due_date, cs.paid_amount, cs.status, cs.approved_by
+                SELECT cs.id, cs.date, cs.amount, cs.description, cs.due_date, cs.paid_amount, cs.status, cs.approved_by, cs.recorded_by
                 FROM credit_sales cs
                 WHERE cs.user_name = :u AND cs.customer_id = :cid
                 ORDER BY cs.date DESC
@@ -1016,9 +1165,9 @@ def add_credit_sale(user_name, customer_id, amount, description, due_date, appro
     try:
         with get_connection() as conn:
             conn.execute(text("""
-                INSERT INTO credit_sales (user_name, customer_id, date, amount, description, due_date, approved_by)
-                VALUES (:u, :cid, :d, :a, :desc, :dd, :ab)
-            """), {"u": user_name, "cid": customer_id, "d": datetime.now().strftime("%Y-%m-%d"), "a": amount, "desc": description, "dd": due_date, "ab": approved_by})
+                INSERT INTO credit_sales (user_name, customer_id, date, amount, description, due_date, approved_by, recorded_by)
+                VALUES (:u, :cid, :d, :a, :desc, :dd, :ab, :rb)
+            """), {"u": user_name, "cid": customer_id, "d": datetime.now().strftime("%Y-%m-%d"), "a": amount, "desc": description, "dd": due_date, "ab": approved_by, "rb": approved_by})
             conn.execute(text("UPDATE customers SET current_balance = current_balance + :a WHERE id = :cid"), {"a": amount, "cid": customer_id})
         return True, "Credit sale recorded"
     except Exception as e:
@@ -1067,13 +1216,24 @@ def record_credit_payment(user_name, credit_sale_id, customer_name_or_id, amount
             if amount > current_balance:
                 return False, f"Payment amount KES {amount:,.2f} exceeds outstanding debt KES {current_balance:,.2f}"
             conn.execute(text("""
-                INSERT INTO credit_payments (user_name, credit_sale_id, payment_date, amount, payment_method, reference)
-                VALUES (:u, :cid, :d, :a, :pm, :r)
-            """), {"u": user_name, "cid": credit_sale_id, "d": datetime.now().strftime("%Y-%m-%d"), "a": amount, "pm": payment_method, "r": reference})
+                INSERT INTO credit_payments (user_name, credit_sale_id, payment_date, amount, payment_method, reference, recorded_by)
+                VALUES (:u, :cid, :d, :a, :pm, :r, :rb)
+            """), {"u": user_name, "cid": credit_sale_id, "d": datetime.now().strftime("%Y-%m-%d"), "a": amount, "pm": payment_method, "r": reference, "rb": user_name})
             new_balance = current_balance - amount
             conn.execute(text("UPDATE customers SET current_balance = :nb WHERE id = :cid"), {"nb": new_balance, "cid": customer_id})
             stmt = text("UPDATE invoices SET paid_amount = paid_amount + :a, payment_status = CASE WHEN paid_amount + :a >= total_amount THEN 'paid' ELSE 'partial' END WHERE user_name = :u AND customer_id = :cid AND status IN ('sent', 'overdue') ORDER BY created_at ASC LIMIT 1")
             conn.execute(stmt, {"a": amount, "u": user_name, "cid": customer_id})
+            if credit_sale_id and credit_sale_id != 0:
+                conn.execute(text("""
+                    UPDATE credit_sales 
+                    SET paid_amount = paid_amount + :a,
+                        status = CASE 
+                            WHEN paid_amount + :a >= amount THEN 'paid' 
+                            WHEN paid_amount + :a > 0 THEN 'partial' 
+                            ELSE status 
+                        END
+                    WHERE id = :cid AND user_name = :u
+                """), {"a": amount, "cid": credit_sale_id, "u": user_name})
         return True, f"Payment recorded. New balance: KES {new_balance:,.2f}"
     except Exception as e:
         return False, str(e)
@@ -1094,44 +1254,85 @@ def get_credit_payment_history(user_name, customer_id):
         return pd.DataFrame()
 
 
-def get_debtors_list(user_name):
+def get_debtors_list(user_name=None):
     try:
         with engine.connect() as conn:
-            df = pd.read_sql(text("""
+            sql = """
                 SELECT c.id, c.name, c.phone, c.current_balance, c.credit_limit,
                        COUNT(cs.id) as unpaid_invoices
                 FROM customers c
                 LEFT JOIN credit_sales cs ON c.id = cs.customer_id AND cs.status = 'pending'
-                WHERE c.user_name = :u AND (c.current_balance > 0 OR EXISTS(
-                    SELECT 1 FROM invoices i WHERE i.user_name = :u AND i.customer_id = c.id AND i.status IN ('sent', 'overdue') AND i.paid_amount < i.total_amount
-                ))
-                GROUP BY c.id
-                ORDER BY c.current_balance DESC
-            """), conn, params={"u": user_name})
+            """
+            where = []
+            params = {}
+            if user_name:
+                where.append("c.user_name = :u")
+                params["u"] = user_name
+            where.append("c.current_balance > 0")
+            sql += " WHERE " + " AND ".join(where) + " GROUP BY c.id ORDER BY c.current_balance DESC"
+            df = pd.read_sql(text(sql), conn, params=params)
         return df
     except Exception:
         return pd.DataFrame()
 
 
-def add_supplier(user_name, name, phone, email="", address="", payment_terms="", avg_delivery_days=0):
+def add_supplier(user_name, name, phone, email="", address="", payment_terms="", avg_delivery_days=0, notes=""):
     try:
         with get_connection() as conn:
             conn.execute(text("""
-                INSERT INTO suppliers (user_name, name, phone, email, address, payment_terms, average_delivery_days)
-                VALUES (:u, :n, :p, :e, :a, :pt, :add)
-            """), {"u": user_name, "n": name, "p": phone, "e": email, "a": address, "pt": payment_terms, "add": avg_delivery_days})
+                INSERT INTO suppliers (user_name, name, phone, email, address, payment_terms, average_delivery_days, notes)
+                VALUES (:u, :n, :p, :e, :a, :pt, :add, :nt)
+            """), {"u": user_name, "n": name, "p": phone, "e": email, "a": address, "pt": payment_terms, "add": avg_delivery_days, "nt": notes})
         return True, "Supplier added"
     except Exception as e:
         return False, str(e)
 
 
-def get_all_suppliers(user_name):
+def get_all_suppliers(user_name=None):
     try:
         with engine.connect() as conn:
-            df = pd.read_sql(text("SELECT id, name, phone, email, payment_terms, average_delivery_days FROM suppliers WHERE user_name = :u ORDER BY name"), conn, params={"u": user_name})
+            if user_name:
+                df = pd.read_sql(text("SELECT id, name, phone, email, address, payment_terms, average_delivery_days, notes FROM suppliers WHERE user_name = :u ORDER BY name"), conn, params={"u": user_name})
+            else:
+                df = pd.read_sql(text("SELECT id, name, phone, email, address, payment_terms, average_delivery_days, notes FROM suppliers ORDER BY name"), conn)
         return df
     except Exception:
         return pd.DataFrame()
+
+
+def add_supplier_history(supplier_id, supplied_items, date=None):
+    try:
+        with get_connection() as conn:
+            conn.execute(text("""
+                INSERT INTO supplier_history (supplier_id, supplied_items, date)
+                VALUES (:sid, :si, :d)
+            """), {"sid": supplier_id, "si": supplied_items, "d": date or datetime.now().strftime("%Y-%m-%d")})
+        return True, "History recorded"
+    except Exception as e:
+        return False, str(e)
+
+
+def get_supplier_history(supplier_id):
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(text("""
+                SELECT id, supplier_id, supplied_items, date, created_at
+                FROM supplier_history
+                WHERE supplier_id = :sid
+                ORDER BY date DESC
+            """), conn, params={"sid": supplier_id})
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def update_supplier_notes(supplier_id, notes):
+    try:
+        with get_connection() as conn:
+            conn.execute(text("UPDATE suppliers SET notes = :n WHERE id = :sid"), {"n": notes, "sid": supplier_id})
+        return True, "Notes updated"
+    except Exception as e:
+        return False, str(e)
 
 
 def record_supplier_payment(user_name, supplier_id, amount, description):
@@ -1241,12 +1442,20 @@ def get_expenses_by_status(user_name, status):
 def get_pending_expenses(user_name=None):
     try:
         with engine.connect() as conn:
-            df = pd.read_sql(text("""
-                SELECT id, requester, amount, category, description, receipt_path, created_at
-                FROM expense_approvals
-                WHERE status = 'pending'
-                ORDER BY created_at ASC
-            """), conn)
+            if user_name:
+                df = pd.read_sql(text("""
+                    SELECT id, requester, amount, category, description, receipt_path, created_at
+                    FROM expense_approvals
+                    WHERE user_name = :u AND status = 'pending'
+                    ORDER BY created_at ASC
+                """), conn, params={"u": user_name})
+            else:
+                df = pd.read_sql(text("""
+                    SELECT id, requester, amount, category, description, receipt_path, created_at
+                    FROM expense_approvals
+                    WHERE status = 'pending'
+                    ORDER BY created_at ASC
+                """), conn)
         return df
     except Exception:
         return pd.DataFrame()
@@ -1293,15 +1502,15 @@ def get_yoy_comparison(user_name):
             current_df = pd.read_sql(text("""
                 SELECT strftime('%m', date) as month, SUM(amount) as total
                 FROM daily_items
-                WHERE user_name = :u AND strftime('%Y', date) = :y AND item_type = 'expense'
+                WHERE strftime('%Y', date) = :y AND item_type = 'expense'
                 GROUP BY month
-            """), conn, params={"u": user_name, "y": str(current_year)})
+            """), conn, params={"y": str(current_year)})
             last_df = pd.read_sql(text("""
                 SELECT strftime('%m', date) as month, SUM(amount) as total
                 FROM daily_items
-                WHERE user_name = :u AND strftime('%Y', date) = :y AND item_type = 'expense'
+                WHERE strftime('%Y', date) = :y AND item_type = 'expense'
                 GROUP BY month
-            """), conn, params={"u": user_name, "y": str(last_year)})
+            """), conn, params={"y": str(last_year)})
             if current_df.empty and last_df.empty:
                 return pd.DataFrame()
             result = current_df.merge(last_df, on="month", how="outer", suffixes=("_current", "_last"))
@@ -1371,9 +1580,23 @@ def get_daily_items(user_name, start_date, end_date):
             df = pd.read_sql(text("""
                 SELECT date, description, amount, category, item_type
                 FROM daily_items
-                WHERE user_name = :u AND date BETWEEN :start AND :end
+                WHERE date BETWEEN :start AND :end
                 ORDER BY date DESC, created_at DESC
-            """), conn, params={"u": user_name, "start": start_date, "end": end_date})
+            """), conn, params={"start": start_date, "end": end_date})
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_all_users_daily_items(start_date, end_date):
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(text("""
+                SELECT date, description, amount, category, item_type
+                FROM daily_items
+                WHERE date BETWEEN :start AND :end
+                ORDER BY date DESC, created_at DESC
+            """), conn, params={"start": start_date, "end": end_date})
         return df
     except Exception:
         return pd.DataFrame()
@@ -1502,10 +1725,14 @@ def mark_message_read(message_id):
 def get_all_users_for_messages(current_user):
     try:
         with engine.connect() as conn:
-            result = conn.execute(text("SELECT COUNT(*) FROM users WHERE role = 'owner'")).fetchone()
-        return (result[0] if result else 0) == 0
+            result = conn.execute(text("""
+                SELECT username, full_name, role FROM users
+                WHERE username != :u AND is_active = 1
+                ORDER BY full_name, username
+            """), {"u": current_user}).fetchall()
+        return [{"username": r[0], "display": f"{r[1]} (@{r[0]}) - {r[2]}"} for r in result]
     except Exception:
-        return False
+        return []
 
 
 def create_invoice(user_name, customer_id, invoice_number, invoice_date, due_date, subtotal, tax_amount, total_amount, notes=""):

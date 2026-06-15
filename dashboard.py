@@ -16,9 +16,11 @@ from app.auth import authenticate, create_user, is_user_blocked
 from app.database import (
     init_db,
     get_all_products,
+    get_top_products_performance,
     update_stock,
     save_daily_item,
     get_daily_items,
+    get_all_users_daily_items,
     add_customer,
     update_customer,
     delete_customer,
@@ -34,6 +36,7 @@ from app.database import (
     set_budget_enhanced,
     get_budget_status,
     get_all_users,
+    get_user_performance,
     activate_user,
     reject_user,
     block_user,
@@ -124,6 +127,8 @@ DEFAULT_SESSION_STATE = {
     "user_role": "cashier",
     "csv_data": None,
     "file_uploaded": False,
+    "data_version": 0,
+    "reset_cashflow_form": False,
     "chat_history": [],
     "chat_open": False,
     "messages_open": False,
@@ -238,13 +243,20 @@ _render_notifications()
 
 
 def get_combined_transaction_data(username):
+    if st.session_state.get("refresh_trigger"):
+        st.session_state.csv_data = None
+        st.session_state.refresh_trigger = False
     all_data = []
     if st.session_state.csv_data is not None and not st.session_state.csv_data.empty:
         all_data.append(st.session_state.csv_data)
+    else:
+        st.session_state.csv_data = load_transactions(username)
+        if not st.session_state.csv_data.empty:
+            all_data.append(st.session_state.csv_data)
     try:
         end_date = date.today().strftime("%Y-%m-%d")
         start_date = (date.today() - timedelta(days=365)).strftime("%Y-%m-%d")
-        daily_df = get_daily_items(username, start_date, end_date)
+        daily_df = get_all_users_daily_items(start_date, end_date)
         if daily_df is not None and not daily_df.empty:
             all_data.append(daily_df)
     except Exception:
@@ -299,10 +311,13 @@ if not st.session_state.logged_in:
             elif not username or not password:
                 st.sidebar.error("Username and password required.")
             else:
-                role = "cashier"
+                role = "owner" if not owner_exists else "cashier"
                 ok, msg = create_user(username, password, role, full_name, email, phone)
                 if ok:
-                    st.sidebar.success("Signup successful. Your account is pending owner approval.")
+                    if owner_exists:
+                        st.sidebar.success("Signup successful. Your account is pending owner approval.")
+                    else:
+                        st.sidebar.success("Account created as owner! You can now login.")
                 else:
                     st.sidebar.error(msg)
     else:
@@ -367,28 +382,33 @@ combined_data = get_combined_transaction_data(st.session_state.user)
 
 # ---- KPI Row ----
 if not combined_data.empty:
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
     expenses = combined_data[combined_data["item_type"] == "expense"]["amount"].sum() if "item_type" in combined_data else combined_data["amount"].sum()
     sales = combined_data[combined_data["item_type"] == "sale"]["amount"].sum() if "item_type" in combined_data else 0
-    with col1:
-        st.metric("Total Sales (MTD)", f"KES {sales:,.0f}")
-    with col2:
-        st.metric("Total Expenses", f"KES {expenses:,.0f}")
-    with col3:
-        st.metric("Net Profit", f"KES {sales - expenses:,.0f}", delta="profit" if sales - expenses > 0 else "loss")
-    with col4:
-        debtors_df = get_debtors_list(st.session_state.user)
-        total_debt = debtors_df["current_balance"].sum() if not debtors_df.empty else 0
-        st.metric("Outstanding Debt", f"KES {total_debt:,.0f}")
-    with col5:
-        low_stock = get_low_stock_products(st.session_state.user)
-        st.metric("Low Stock Items", len(low_stock))
-    with col6:
-        try:
-            score = calculate_health_score(combined_data)
-            st.metric("Health Score", f"{score:.0f}/100" if score else "N/A")
-        except:
-            st.metric("Health Score", "N/A")
+    kpi_items = [
+        ("Total Sales (MTD)", f"KES {sales:,.0f}"),
+        ("Total Expenses", f"KES {expenses:,.0f}"),
+    ]
+    if check_permission("owner"):
+        profit = sales - expenses
+        kpi_items.append(("Net Profit", f"KES {profit:,.0f}", "profit" if profit > 0 else "loss"))
+    debtors_df = get_debtors_list(st.session_state.user)
+    total_debt = debtors_df["current_balance"].sum() if not debtors_df.empty else 0
+    kpi_items.append(("Outstanding Debt", f"KES {total_debt:,.0f}"))
+    if check_permission("manager"):
+        low_stock = get_low_stock_products()
+        kpi_items.append(("Low Stock Items", len(low_stock)))
+    try:
+        score = calculate_health_score(combined_data)
+        kpi_items.append(("Health Score", f"{score:.0f}/100" if score else "N/A"))
+    except Exception:
+        kpi_items.append(("Health Score", "N/A"))
+    cols = st.columns(len(kpi_items))
+    for col, item in zip(cols, kpi_items):
+        with col:
+            if len(item) == 3:
+                st.metric(item[0], item[1], delta=item[2])
+            else:
+                st.metric(item[0], item[1])
     st.divider()
 else:
     st.info("📭 Add daily transactions to see your business KPIs")
@@ -409,29 +429,30 @@ def tab_daily_entry():
     st.subheader("Quick Transaction Entry")
     col_q1, col_q2, col_q3, col_q4, col_q5, col_q6 = st.columns(6)
     with col_q1:
-        if st.button("🍔 Food", width="stretch", key="quick_food"):
-            st.session_state.entry_type = "expense"
-            st.session_state.entry_desc = "Food"
+        if st.button("💵 Cash Sale", width="stretch", key="quick_cash_sale"):
+            st.session_state.entry_type = "sale"
+            st.session_state.entry_desc = "Cash Sale"
             st.rerun()
     with col_q2:
-        if st.button("⛽ Fuel", width="stretch", key="quick_fuel"):
-            st.session_state.entry_type = "expense"
-            st.session_state.entry_desc = "Fuel"
+        if st.button("🏷️ Credit Sale", width="stretch", key="quick_credit_sale"):
+            st.session_state.show_credit_sale = True
+            st.session_state.entry_type = "sale"
+            st.session_state.entry_desc = "Credit Sale"
             st.rerun()
     with col_q3:
-        if st.button("🚖 Transport", width="stretch", key="quick_transport"):
+        if st.button("📦 Stock Purchase", width="stretch", key="quick_stock_purchase"):
             st.session_state.entry_type = "expense"
-            st.session_state.entry_desc = "Transport"
+            st.session_state.entry_desc = "Stock Purchase"
             st.rerun()
     with col_q4:
-        if st.button("🏠 Rent", width="stretch", key="quick_rent"):
+        if st.button("👔 Salary", width="stretch", key="quick_salary"):
             st.session_state.entry_type = "expense"
-            st.session_state.entry_desc = "Rent"
+            st.session_state.entry_desc = "Salary/Wages"
             st.rerun()
     with col_q5:
-        if st.button("💰 Sale", width="stretch", key="quick_sale"):
-            st.session_state.entry_type = "sale"
-            st.session_state.entry_desc = "Sale"
+        if st.button("💡 Utilities", width="stretch", key="quick_utilities"):
+            st.session_state.entry_type = "expense"
+            st.session_state.entry_desc = "Utilities (Power, Water, Internet)"
             st.rerun()
     with col_q6:
         if st.button("📦 Stock Sale", width="stretch", key="quick_stock_sale"):
@@ -487,6 +508,7 @@ def tab_daily_entry():
                             else:
                                 st.error(f"Stock updated but daily item failed: {save_msg}")
                             st.session_state.show_stock_sale = False
+                            st.session_state.refresh_trigger = True
                             st.session_state.reset_entry_form = True
                             time.sleep(0.5)
                             st.rerun()
@@ -494,6 +516,106 @@ def tab_daily_entry():
                             st.error(msg)
             else:
                 st.warning("No products in inventory. Add products in Inventory tab.")
+    
+    # Credit Sale section
+    if entry_type == "Sale" and (description == "Credit Sale" or st.session_state.get("show_credit_sale", False)):
+        st.subheader("💳 Give Credit (Sale on Credit)")
+        customer_df = get_all_customers()
+        if not customer_df.empty:
+            customer_options = {f"{row['name']} | Bal: KES {row['current_balance']:,.2f} | Limit: KES {row['credit_limit']:,.2f}": row['id'] for _, row in customer_df.iterrows()}
+            options_list = list(customer_options.keys())
+            default_idx = 0
+            selected_display = st.selectbox("Select Customer", options_list, index=default_idx, key="credit_customer_select")
+            selected_customer_id = customer_options[selected_display]
+            customer_name = selected_display.split(" | ")[0]
+            customer_balance = customer_df[customer_df["id"] == selected_customer_id]["current_balance"].values[0]
+            st.caption(f"Current outstanding balance: KES {customer_balance:,.2f}")
+        else:
+            st.warning("No customers found. Add a customer first.")
+            with st.expander("➕ Add Customer Now"):
+                c1, c2 = st.columns(2)
+                with c1:
+                    cust_name = st.text_input("Full Name", key="credit_cust_name")
+                    cust_phone = st.text_input("Phone Number", key="credit_cust_phone")
+                with c2:
+                    cust_email = st.text_input("Email", key="credit_cust_email")
+                    credit_limit = st.number_input("Credit Limit (KES)", min_value=0.0, value=0.0, key="credit_cust_limit")
+                if st.button("Add Customer", key="add_credit_customer", type="primary"):
+                    if cust_name and cust_phone:
+                        ok, msg = add_customer(st.session_state.user, cust_name, cust_phone, cust_email, "", credit_limit, st.session_state.user, "")
+                        if ok:
+                            st.success(f"✅ {msg}")
+                            time.sleep(0.2)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+                    else:
+                        st.warning("Name and phone are required")
+            selected_customer_id = None
+            customer_name = ""
+            customer_balance = 0
+
+        if selected_customer_id:
+            col_ca1, col_ca2, col_ca3 = st.columns(3)
+            with col_ca1:
+                credit_amount = st.number_input("Credit Amount (KES)", min_value=0.0, step=100.0, key="credit_amount")
+            with col_ca2:
+                credit_desc = st.text_input("Description / Items", key="credit_description")
+            with col_ca3:
+                credit_due = st.date_input("Due Date", value=date.today() + timedelta(days=30), key="credit_due_date")
+            if st.button("✅ Record Credit Sale", key="record_credit_sale", type="primary"):
+                if credit_amount > 0 and credit_desc:
+                    ok, msg = add_credit_sale(
+                        st.session_state.user,
+                        selected_customer_id,
+                        credit_amount,
+                        credit_desc,
+                        credit_due.strftime("%Y-%m-%d"),
+                        st.session_state.user
+                    )
+                    if ok:
+                        st.success(f"✅ Credit of KES {credit_amount:,.2f} recorded for {customer_name}")
+                        st.session_state.show_credit_sale = False
+                        st.session_state.refresh_trigger = True
+                        time.sleep(0.2)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+                else:
+                    st.warning("Amount and description are required")
+    
+    if not check_permission("accountant"):
+        st.divider()
+        with st.expander("💰 Record Payment from Debtor"):
+            debtors_df = get_all_customers(st.session_state.user)
+            debtors_df = debtors_df[debtors_df["current_balance"] > 0]
+            if not debtors_df.empty:
+                debt_opts = {f"{row['name']} | Bal: KES {row['current_balance']:,.2f}": row['id'] for _, row in debtors_df.iterrows()}
+                sel_debtor = st.selectbox("Select Debtor", list(debt_opts.keys()), key="debtor_payment_select")
+                debt_cust_id = debt_opts[sel_debtor]
+                debt_cust_name = sel_debtor.split(" | ")[0]
+                debt_cust_bal = debtors_df[debtors_df["id"] == debt_cust_id]["current_balance"].values[0]
+                st.caption(f"Outstanding balance: KES {debt_cust_bal:,.2f}")
+                col_dp1, col_dp2, col_dp3 = st.columns(3)
+                with col_dp1:
+                    pay_amt = st.number_input("Payment Amount (KES)", min_value=0.0, max_value=float(debt_cust_bal), step=100.0, key="dp_amount")
+                with col_dp2:
+                    pay_method = st.selectbox("Method", ["cash", "mpesa", "bank"], key="dp_method")
+                with col_dp3:
+                    pay_ref = st.text_input("Reference (optional)", key="dp_ref")
+                if st.button("✅ Record Debtor Payment", key="record_debtor_payment", type="primary"):
+                    if pay_amt > 0:
+                        ok, msg = record_credit_payment(st.session_state.user, 0, debt_cust_id, pay_amt, pay_method, pay_ref)
+                        if ok:
+                            st.success(f"✅ Payment of KES {pay_amt:,.2f} recorded for {debt_cust_name}")
+                            time.sleep(0.2)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+                    else:
+                        st.warning("Enter payment amount")
+            else:
+                st.info("No debtors with outstanding balance")
     
     with st.expander("📸 Upload Receipt (OCR)"):
         receipt_file = st.file_uploader("Choose receipt image (JPG/PNG) or PDF", type=["jpg", "png", "pdf"], key="receipt_upload")
@@ -535,6 +657,7 @@ def tab_daily_entry():
                             success, msg = save_daily_item(st.session_state.user, receipt_date.strftime("%Y-%m-%d"), f"Receipt: {merchant}", manual_total, receipt_category, "expense")
                             if success:
                                 st.success(f"Added expense: {merchant} for KES {manual_total:.2f}")
+                                st.session_state.refresh_trigger = True
                                 st.session_state.reset_entry_form = True
                                 st.rerun()
                             else:
@@ -618,7 +741,7 @@ def tab_inventory():
                 else:
                     st.warning("Product name and SKU required")
         with inv_tab3:
-            low_stock = get_low_stock_products(st.session_state.user)
+            low_stock = get_low_stock_products()
             if not low_stock.empty:
                 st.warning("⚠️ Products below minimum stock level:")
                 for _, row in low_stock.iterrows():
@@ -844,7 +967,7 @@ def _render_debtors_tab():
                     credit_sales_df, payments_df = get_customer_credit_history(st.session_state.user, row['id'])
                     if not credit_sales_df.empty:
                         st.markdown("**Credit Sales:**")
-                        st.dataframe(credit_sales_df[['date', 'amount', 'description', 'due_date', 'paid_amount', 'status']], width="stretch")
+                        st.dataframe(credit_sales_df[['date', 'amount', 'description', 'due_date', 'paid_amount', 'status', 'approved_by', 'recorded_by']], width="stretch")
                     else:
                         st.info("No credit sales recorded")
                     
@@ -943,26 +1066,25 @@ def tab_suppliers():
     else:
         sup_tab1, sup_tab2, sup_tab3 = st.tabs(["Suppliers", "Add Supplier", "Performance"])
         with sup_tab1:
-            suppliers_df = get_all_suppliers(st.session_state.user)
+            suppliers_df = get_all_suppliers()
             if not suppliers_df.empty:
-                st.dataframe(suppliers_df, width="stretch")
+                st.dataframe(suppliers_df[["name", "phone", "email", "payment_terms", "average_delivery_days", "notes"]], width="stretch")
             else:
                 st.info("No suppliers added")
         with sup_tab2:
             sup_name = st.text_input("Supplier Name", key="sup_name")
             sup_phone = st.text_input("Phone", key="sup_phone")
             sup_email = st.text_input("Email", key="sup_email")
+            sup_notes = st.text_area("What does this supplier supply?", key="sup_notes", height=60)
             payment_terms = st.selectbox("Payment Terms", ["cash_on_delivery", "net_30", "net_60", "net_90"], key="sup_payment_terms")
             avg_delivery = st.number_input("Avg Delivery Days", min_value=0, value=7, key="sup_avg_delivery")
             if st.button("Add Supplier", key="add_supplier_btn"):
                 if sup_name and sup_phone:
-                    success, msg = add_supplier(st.session_state.user, sup_name, sup_phone, sup_email, "", payment_terms, avg_delivery)
+                    success, msg = add_supplier(st.session_state.user, sup_name, sup_phone, sup_email, "", payment_terms, avg_delivery, sup_notes)
                     if success:
                         st.success(msg)
-                        st.session_state.pop("sup_name", None)
-                        st.session_state.pop("sup_phone", None)
-                        st.session_state.pop("sup_email", None)
-                        st.session_state.pop("sup_avg_delivery", None)
+                        for k in ["sup_name", "sup_phone", "sup_email", "sup_notes", "sup_avg_delivery"]:
+                            st.session_state.pop(k, None)
                         st.rerun()
                     else:
                         st.error(msg)
@@ -1090,12 +1212,51 @@ def tab_reports_analytics():
         else:
             st.info("Need at least 2 years of data for comparison")
     with report_tab2:
-        st.subheader("Top Selling Products")
-        products_df = get_all_products(st.session_state.user)
+        st.subheader("Top Products by Business Impact")
+        products_df = get_top_products_performance(st.session_state.user)
         if not products_df.empty:
-            st.dataframe(products_df[["name", "current_stock", "selling_price"]].head(10), width="stretch")
-            fig = px.bar(products_df.head(10), x="name", y="selling_price", title="Top Products by Price")
-            st.plotly_chart(fig, width="stretch")
+            display_df = products_df.copy()
+            money_cols = ["buying_price", "selling_price", "profit_per_unit", "stock_value", "sales_revenue", "purchase_cost"]
+            for col in money_cols:
+                if col in display_df.columns:
+                    display_df[col] = display_df[col].apply(lambda x: f"KES {float(x):,.2f}" if pd.notna(x) else "KES 0.00")
+            display_df["profit_margin_percent"] = display_df["profit_margin_percent"].apply(lambda x: f"{float(x):.1f}%")
+            display_df = display_df.rename(columns={
+                "name": "Product",
+                "category": "Category",
+                "sku": "SKU",
+                "current_stock": "Current Stock",
+                "min_stock_level": "Min Stock",
+                "buying_price": "Buying Price",
+                "selling_price": "Selling Price",
+                "profit_per_unit": "Profit/Unit",
+                "profit_margin_percent": "Margin %",
+                "stock_value": "Stock Value",
+                "units_sold": "Units Sold",
+                "sales_revenue": "Sales Revenue",
+                "units_purchased": "Units Purchased",
+                "purchase_cost": "Purchase Cost",
+                "stock_status": "Stock Status"
+            })
+            st.dataframe(display_df[["Product", "Category", "Current Stock", "Min Stock", "Buying Price", "Selling Price", "Profit/Unit", "Margin %", "Units Sold", "Sales Revenue", "Stock Value", "Stock Status"]].head(10), use_container_width=True)
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                fig1 = px.bar(products_df.head(10), x="name", y="sales_revenue", title="Top Products by Sales Revenue", labels={"name": "Product", "sales_revenue": "Sales Revenue (KES)"})
+                st.plotly_chart(fig1, use_container_width=True)
+            
+            with col2:
+                fig2 = px.bar(products_df.head(10), x="name", y="profit_per_unit", title="Top Products by Profit per Unit", labels={"name": "Product", "profit_per_unit": "Profit per Unit (KES)"})
+                st.plotly_chart(fig2, use_container_width=True)
+            
+            col3, col4 = st.columns(2)
+            with col3:
+                fig3 = px.bar(products_df.head(10), x="name", y="units_sold", title="Top Products by Units Sold", labels={"name": "Product", "units_sold": "Units Sold"})
+                st.plotly_chart(fig3, use_container_width=True)
+            
+            with col4:
+                fig4 = px.bar(products_df.head(10), x="name", y="profit_margin_percent", title="Top Products by Profit Margin %", labels={"name": "Product", "profit_margin_percent": "Margin %"})
+                st.plotly_chart(fig4, use_container_width=True)
         else:
             st.info("Add products to see top sellers")
     with report_tab3:
@@ -1150,6 +1311,7 @@ def tab_budgets():
                 success, msg = set_budget_enhanced(st.session_state.user, budget_cat, budget_amt, "monthly", budget_year, budget_month)
                 if success:
                     st.success(msg)
+                    st.rerun()
                 else:
                     st.error(msg)
         st.subheader(f"Budget Status - {budget_year}/{budget_month}")
@@ -1173,7 +1335,7 @@ def tab_user_management():
     if st.session_state.user_role != "owner":
         st.warning("Only the business owner can manage users")
     else:
-        tab_users, tab_add, tab_pending = st.tabs(["👤 Manage Users", "Add New User", "📋 Pending Approvals"])
+        tab_users, tab_performance, tab_add, tab_pending = st.tabs(["👤 Manage Users", "📊 Employee Performance", "Add New User", "📋 Pending Approvals"])
         with tab_pending:
             pending = get_pending_users()
             if pending:
@@ -1259,6 +1421,73 @@ def tab_user_management():
                                         st.error(msg)
             else:
                 st.info("No users found")
+        with tab_performance:
+            perf = get_user_performance()
+            if not perf.empty:
+                st.subheader("📊 Employee Performance")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    fig1 = px.bar(perf, x="username", y="transactions_count", title="Transactions by Employee", labels={"username": "Employee", "transactions_count": "Transactions"})
+                    st.plotly_chart(fig1, use_container_width=True)
+                
+                with col2:
+                    fig2 = px.bar(perf, x="username", y="credit_sales_count", title="Credit Sales by Employee", labels={"username": "Employee", "credit_sales_count": "Credit Sales"})
+                    st.plotly_chart(fig2, use_container_width=True)
+                
+                col3, col4 = st.columns(2)
+                with col3:
+                    fig3 = px.bar(perf, x="username", y="transactions_total", title="Transaction Total by Employee", labels={"username": "Employee", "transactions_total": "Total (KES)"})
+                    st.plotly_chart(fig3, use_container_width=True)
+                
+                with col4:
+                    fig4 = px.bar(perf, x="username", y="credit_sales_total", title="Credit Sales Total by Employee", labels={"username": "Employee", "credit_sales_total": "Total (KES)"})
+                    st.plotly_chart(fig4, use_container_width=True)
+                
+                col5, col6 = st.columns(2)
+                with col5:
+                    fig5 = px.pie(perf, values="customers_count", names="username", title="Customers by Employee")
+                    st.plotly_chart(fig5, use_container_width=True)
+                
+                with col6:
+                    fig6 = px.bar(perf, x="username", y="daily_income", title="Daily Income by Employee", labels={"username": "Employee", "daily_income": "Income (KES)"})
+                    st.plotly_chart(fig6, use_container_width=True)
+                
+                display_df = perf.copy()
+                money_cols = ["transactions_total", "daily_income", "daily_expenses", "credit_sales_total", "credit_payments_total", "invoices_total", "cash_flow_net", "expenses_approved"]
+                for col in money_cols:
+                    if col in display_df.columns:
+                        display_df[col] = display_df[col].apply(lambda x: f"KES {float(x):,.2f}" if pd.notna(x) else "KES 0.00")
+                count_cols = ["transactions_count", "daily_items_count", "customers_count", "credit_sales_count", "credit_payments_count", "products_count", "suppliers_count", "invoices_count", "cash_flow_count", "expense_requests_count"]
+                for col in count_cols:
+                    if col in display_df.columns:
+                        display_df[col] = display_df[col].fillna(0).astype(int)
+                display_df = display_df.rename(columns={
+                    "username": "Username",
+                    "role": "Role",
+                    "full_name": "Full Name",
+                    "transactions_count": "Transactions",
+                    "transactions_total": "Trans. Total",
+                    "daily_items_count": "Daily Items",
+                    "daily_income": "Daily Income",
+                    "daily_expenses": "Daily Expenses",
+                    "customers_count": "Customers",
+                    "credit_sales_count": "Credit Sales",
+                    "credit_sales_total": "Credit Sales Total",
+                    "credit_payments_count": "Credit Payments",
+                    "credit_payments_total": "Credit Payments Total",
+                    "products_count": "Products",
+                    "suppliers_count": "Suppliers",
+                    "invoices_count": "Invoices",
+                    "invoices_total": "Invoices Total",
+                    "cash_flow_count": "Cash Flow Entries",
+                    "cash_flow_net": "Cash Flow Net",
+                    "expense_requests_count": "Expense Requests",
+                    "expenses_approved": "Expenses Approved"
+                })
+                st.dataframe(display_df, use_container_width=True)
+            else:
+                st.info("No employee performance data available")
         with tab_add:
             st.subheader("Add New User")
             new_user = st.text_input("Username", key="new_user")
@@ -1545,7 +1774,7 @@ def render_inbox_tab():
                                 st.rerun()
                         with col_m:
                             if not row["is_read"]:
-                                if st.button("Mark as read", key=f"read_{row['id']}"):
+                                if st.button("✔️ Mark as read", key=f"read_{row['id']}"):
                                     mark_message_read(row["id"])
         else:
             st.info("No messages match your search")
